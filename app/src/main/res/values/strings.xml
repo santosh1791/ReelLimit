@@ -1,0 +1,4 @@
+<resources>
+    <string name="app_name">ReelLimit</string>
+    <string name="accessibility_service_description">Monitors foreground usage of selected social apps (Instagram, Facebook, YouTube) to remind you at 5 minutes and safely return to the home screen after 6 minutes.</string>
+</resources>
