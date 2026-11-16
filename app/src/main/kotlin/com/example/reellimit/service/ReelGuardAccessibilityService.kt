@@ -36,29 +36,24 @@ class ReelGuardAccessibilityService : AccessibilityService() {
         )
     }
 
-    // Tracking state
+    // Active tracking state
     private var activeAppPackage: String? = null
-    private var sessionStartTime: Long = 0L
-    private var alertShown: Boolean = false
+    private var accumulatedUsageMs: Long = 0L
+    private var segmentStartRealtime: Long = 0L
     private var isTickerRunning: Boolean = false
+    private var alertShown: Boolean = false
 
-    // Anti-loop cooldowns:
-    // 1. For auto-closing (when limit reached)
+    // Anti-loop cooldowns
     private var lastAutoExitTime: Long = 0L
     private val AUTO_EXIT_COOLDOWN_MS = 3500L
 
-    // 2. For manual home exit (ignores trailing minimize/onStop events from the closing app)
-    private var lastUserHomeTime: Long = 0L
-    private var lastClosedAppPackage: String? = null
-    private val MANUAL_HOME_COOLDOWN_MS = 2500L
+    // Resume window: If user switches away or transient events occur, keep accumulated time for 30s
+    private var pendingSessionResetRunnable: Runnable? = null
+    private val SESSION_RESUME_WINDOW_MS = 30_000L // 30 seconds
 
     // Demo Mode timings (10 seconds alert, 15 seconds exit)
     private val DEMO_ALERT_MS = 10 * 1000L
     private val DEMO_EXIT_MS = 15 * 1000L
-
-    // Grace period for brief transient switches (e.g. volume, quick reply)
-    private var pendingExitRunnable: Runnable? = null
-    private val GRACE_PERIOD_MS = 3000L
 
     private val tickerRunnable = object : Runnable {
         override fun run() {
@@ -70,17 +65,18 @@ class ReelGuardAccessibilityService : AccessibilityService() {
             val alertThreshold = if (isDemo) DEMO_ALERT_MS else (alertMinutes * 60 * 1000L)
             val exitThreshold = if (isDemo) DEMO_EXIT_MS else ((alertMinutes + 1) * 60 * 1000L)
 
-            val elapsed = SystemClock.elapsedRealtime() - sessionStartTime
-            val elapsedSec = elapsed / 1000
+            val currentSegment = SystemClock.elapsedRealtime() - segmentStartRealtime
+            val totalElapsedMs = accumulatedUsageMs + currentSegment
+            val totalElapsedSec = totalElapsedMs / 1000
             val alertSec = alertThreshold / 1000
             val exitSec = exitThreshold / 1000
 
-            if (elapsedSec % 2L == 0L || elapsedSec <= 3) {
-                Log.d(TAG, "[$appName] Active usage: ${elapsedSec}s (Alert at ${alertSec}s, Exit at ${exitSec}s, Demo=$isDemo)")
+            if (totalElapsedSec % 2L == 0L || totalElapsedSec <= 3) {
+                Log.d(TAG, "[$appName] Active usage: ${totalElapsedSec}s (Alert at ${alertSec}s, Exit at ${exitSec}s, Demo=$isDemo)")
             }
 
             // 1. Alert threshold
-            if (elapsed >= alertThreshold && !alertShown) {
+            if (totalElapsedMs >= alertThreshold && !alertShown) {
                 alertShown = true
                 val msg = if (isDemo) {
                     "⚡ [DEMO] ${alertSec}s exceeded for $appName!"
@@ -94,11 +90,10 @@ class ReelGuardAccessibilityService : AccessibilityService() {
             }
 
             // 2. Exit threshold
-            if (elapsed >= exitThreshold) {
+            if (totalElapsedMs >= exitThreshold) {
                 Log.d(TAG, "[$appName] Maximum limit reached (${exitSec}s)! Closing app and returning to home screen.")
                 lastAutoExitTime = SystemClock.elapsedRealtime()
-                lastClosedAppPackage = pkg
-                stopSession(dismissOverlay = true)
+                resetSession(dismissOverlay = true)
                 takeUserToHomeScreen()
                 return
             }
@@ -122,80 +117,120 @@ class ReelGuardAccessibilityService : AccessibilityService() {
 
         val pkgName = event.packageName?.toString() ?: return
 
-        // 1. Ignore events from our own app or overlay
+        // 1. Ignore events from our own app or overlay window
         if (pkgName == packageName) {
             return
         }
 
-        // 2. Ignore transient system packages (status bar, volume dialog, keyboard, autofill, notification shade)
-        // Pulling down the notification shade (com.android.systemui) does NOT interrupt the session!
+        // 2. Ignore transient system & OEM packages (Xiaomi HyperOS, keyboards, WebViews, autofill, notification shade)
         if (isSystemTransientPackage(pkgName)) {
             return
         }
 
-        // 3. Auto-close cooldown check
+        // 3. Auto-close cooldown: ignore lingering minimize events right after force-close
         if (SystemClock.elapsedRealtime() - lastAutoExitTime < AUTO_EXIT_COOLDOWN_MS) {
             return
         }
 
-        // 4. Manual Home exit cooldown check:
-        // Ignore trailing minimize/onStop window events from the app that the user just closed to Home
-        if (SystemClock.elapsedRealtime() - lastUserHomeTime < MANUAL_HOME_COOLDOWN_MS && pkgName == lastClosedAppPackage) {
-            Log.d(TAG, "Ignoring trailing minimize event from closed app ($pkgName)")
-            return
-        }
-
         if (DEFAULT_TARGET_APPS.containsKey(pkgName)) {
-            cancelPendingGraceExit()
+            // Cancel any pending session timeout since user is back in the monitored app
+            cancelPendingSessionReset()
 
-            // If already tracking this exact app, let the running ticker continue
-            if (activeAppPackage == pkgName) {
+            if (activeAppPackage == pkgName && isTickerRunning) {
+                // Already actively running on this app
                 return
             }
 
-            // User opened or switched to a monitored app
-            startSession(pkgName)
+            // Resume or start session
+            resumeOrStartSession(pkgName)
         } else {
-            // User switched away to an unmonitored app or Home launcher
-            if (activeAppPackage != null) {
-                if (isLauncherPackage(pkgName)) {
-                    Log.d(TAG, "User returned to Home/Launcher ($pkgName). Stopping session.")
-                    lastUserHomeTime = SystemClock.elapsedRealtime()
-                    lastClosedAppPackage = activeAppPackage
-                    cancelPendingGraceExit()
-                    stopSession(dismissOverlay = true)
-                } else {
-                    scheduleGraceExit(pkgName)
-                }
+            // User navigated to a non-monitored package (e.g. Launcher or another app)
+            if (activeAppPackage != null && isTickerRunning) {
+                pauseActiveSession(pkgName)
             }
         }
     }
 
-    private fun startSession(packageName: String) {
-        stopSession(dismissOverlay = true)
-        activeAppPackage = packageName
-        sessionStartTime = SystemClock.elapsedRealtime()
-        alertShown = false
-        isTickerRunning = true
-
+    private fun resumeOrStartSession(packageName: String) {
+        val now = SystemClock.elapsedRealtime()
         val appName = DEFAULT_TARGET_APPS[packageName] ?: packageName
         val isDemo = isDemoMode()
         val alertMinutes = getAlertMinutes()
 
-        Log.d(TAG, "=== STARTED MONITORING [$appName] (Limit=${alertMinutes}m, Demo=$isDemo) ===")
+        if (activeAppPackage == packageName && accumulatedUsageMs > 0) {
+            // RESUME SESSION: Keep existing accumulated usage!
+            segmentStartRealtime = now
+            isTickerRunning = true
 
-        // Show live chronometer timer in notification shade
-        notificationHelper.showTimerNotification(
-            appName = appName,
-            sessionStartTimeWallClock = System.currentTimeMillis(),
-            alertMinutes = alertMinutes,
-            isDemo = isDemo
-        )
+            val totalElapsedMs = accumulatedUsageMs
+            Log.d(TAG, "=== RESUMING [$appName] (Accumulated=${totalElapsedMs / 1000}s, Limit=${alertMinutes}m) ===")
 
-        mainHandler.post(tickerRunnable)
+            // Update live notification with correct accumulated elapsed time base
+            notificationHelper.showTimerNotification(
+                appName = appName,
+                sessionStartTimeWallClock = System.currentTimeMillis() - totalElapsedMs,
+                alertMinutes = alertMinutes,
+                isDemo = isDemo
+            )
+
+            mainHandler.post(tickerRunnable)
+        } else {
+            // START FRESH SESSION
+            resetSession(dismissOverlay = true)
+            activeAppPackage = packageName
+            accumulatedUsageMs = 0L
+            segmentStartRealtime = now
+            alertShown = false
+            isTickerRunning = true
+
+            Log.d(TAG, "=== STARTED FRESH SESSION [$appName] (Limit=${alertMinutes}m, Demo=$isDemo) ===")
+
+            notificationHelper.showTimerNotification(
+                appName = appName,
+                sessionStartTimeWallClock = System.currentTimeMillis(),
+                alertMinutes = alertMinutes,
+                isDemo = isDemo
+            )
+
+            mainHandler.post(tickerRunnable)
+        }
     }
 
-    private fun stopSession(dismissOverlay: Boolean) {
+    private fun pauseActiveSession(newPkg: String) {
+        val now = SystemClock.elapsedRealtime()
+        if (isTickerRunning) {
+            accumulatedUsageMs += (now - segmentStartRealtime)
+            mainHandler.removeCallbacks(tickerRunnable)
+            isTickerRunning = false
+        }
+
+        val appName = DEFAULT_TARGET_APPS[activeAppPackage] ?: "App"
+        Log.d(TAG, "[$appName] Paused at ${accumulatedUsageMs / 1000}s (switched to $newPkg). Holding session for 30s.")
+
+        // Schedule session reset only if the user stays away for more than 30 seconds
+        scheduleSessionReset()
+    }
+
+    private fun scheduleSessionReset() {
+        if (pendingSessionResetRunnable != null) return
+
+        val runnable = Runnable {
+            Log.d(TAG, "Session resume window (30s) expired. Resetting session to 0.")
+            resetSession(dismissOverlay = true)
+            pendingSessionResetRunnable = null
+        }
+        pendingSessionResetRunnable = runnable
+        mainHandler.postDelayed(runnable, SESSION_RESUME_WINDOW_MS)
+    }
+
+    private fun cancelPendingSessionReset() {
+        pendingSessionResetRunnable?.let {
+            mainHandler.removeCallbacks(it)
+            pendingSessionResetRunnable = null
+        }
+    }
+
+    private fun resetSession(dismissOverlay: Boolean) {
         if (isTickerRunning) {
             mainHandler.removeCallbacks(tickerRunnable)
             isTickerRunning = false
@@ -203,31 +238,13 @@ class ReelGuardAccessibilityService : AccessibilityService() {
         if (dismissOverlay) {
             overlayManager.dismiss()
         }
-        // Dismiss notification timer when exiting monitored app
         if (::notificationHelper.isInitialized) {
             notificationHelper.dismissTimerNotification()
         }
         activeAppPackage = null
+        accumulatedUsageMs = 0L
+        segmentStartRealtime = 0L
         alertShown = false
-    }
-
-    private fun scheduleGraceExit(newPkg: String) {
-        if (pendingExitRunnable != null) return
-
-        val runnable = Runnable {
-            Log.d(TAG, "Grace period expired in ($newPkg). Stopping session.")
-            stopSession(dismissOverlay = true)
-            pendingExitRunnable = null
-        }
-        pendingExitRunnable = runnable
-        mainHandler.postDelayed(runnable, GRACE_PERIOD_MS)
-    }
-
-    private fun cancelPendingGraceExit() {
-        pendingExitRunnable?.let {
-            mainHandler.removeCallbacks(it)
-            pendingExitRunnable = null
-        }
     }
 
     private fun takeUserToHomeScreen() {
@@ -247,13 +264,36 @@ class ReelGuardAccessibilityService : AccessibilityService() {
     }
 
     private fun isSystemTransientPackage(pkg: String): Boolean {
-        return pkg == "com.android.systemui" ||
-                pkg == "android" ||
-                pkg == "com.google.android.inputmethod.latin" ||
-                pkg == "com.touchtype.swiftkey" ||
-                pkg == "com.google.android.gms" ||
-                pkg.contains("inputmethod") ||
-                pkg.contains("accessibility")
+        // Essential Android system packages
+        if (pkg == "com.android.systemui" ||
+            pkg == "android" ||
+            pkg == "com.google.android.inputmethod.latin" ||
+            pkg == "com.touchtype.swiftkey" ||
+            pkg == "com.google.android.gms" ||
+            pkg == "com.google.android.webview" ||
+            pkg == "com.android.permissioncontroller" ||
+            pkg == "com.google.android.packageinstaller"
+        ) {
+            return true
+        }
+
+        // Generic filters
+        if (pkg.contains("inputmethod") ||
+            pkg.contains("accessibility") ||
+            pkg.contains("overlay")
+        ) {
+            return true
+        }
+
+        // Xiaomi / HyperOS specific system packages (Game Turbo, sidebar, floating windows, cleaners, security)
+        // Note: com.miui.home is the Home Launcher, handled separately
+        if ((pkg.startsWith("com.miui.") && pkg != "com.miui.home") ||
+            pkg.startsWith("com.xiaomi.")
+        ) {
+            return true
+        }
+
+        return false
     }
 
     private fun isLauncherPackage(pkg: String): Boolean {
@@ -288,12 +328,12 @@ class ReelGuardAccessibilityService : AccessibilityService() {
 
     override fun onInterrupt() {
         Log.w(TAG, "Accessibility service interrupted")
-        stopSession(dismissOverlay = true)
+        resetSession(dismissOverlay = true)
     }
 
     override fun onDestroy() {
         super.onDestroy()
-        stopSession(dismissOverlay = true)
+        resetSession(dismissOverlay = true)
         Log.d(TAG, "ReelGuardAccessibilityService destroyed")
     }
 }
