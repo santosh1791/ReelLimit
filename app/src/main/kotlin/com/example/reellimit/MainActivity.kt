@@ -1,8 +1,10 @@
 package com.example.reellimit
 
+import android.Manifest
 import android.accessibilityservice.AccessibilityServiceInfo
 import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
@@ -10,9 +12,10 @@ import android.provider.Settings
 import android.view.accessibility.AccessibilityManager
 import android.widget.Toast
 import androidx.activity.ComponentActivity
+import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
-import androidx.compose.foundation.background
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -21,9 +24,11 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.core.content.ContextCompat
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
@@ -77,7 +82,7 @@ class MainActivity : ComponentActivity() {
             openOverlaySettings()
             return
         }
-        overlayPreviewManager.showAlert("Instagram", "🧪 Test Preview: Usage of 5 mins exceeded!") {
+        overlayPreviewManager.showAlert("Instagram", "🧪 Test Preview: Usage limit exceeded!") {
             Toast.makeText(this, "Alert OK tapped!", Toast.LENGTH_SHORT).show()
         }
     }
@@ -90,17 +95,46 @@ fun ReelLimitHomeScreen(
     onOpenAccessibilitySettings: () -> Unit,
     onTestOverlay: () -> Unit
 ) {
-    val context = androidx.compose.ui.platform.LocalContext.current
+    val context = LocalContext.current
     val lifecycleOwner = LocalLifecycleOwner.current
+
+    val prefs = remember {
+        context.getSharedPreferences(ReelGuardAccessibilityService.PREFS_NAME, Context.MODE_PRIVATE)
+    }
 
     var hasOverlayPermission by remember { mutableStateOf(Settings.canDrawOverlays(context)) }
     var isAccessibilityEnabled by remember {
         mutableStateOf(isAccessibilityServiceEnabled(context, ReelGuardAccessibilityService::class.java))
     }
-
-    val prefs = remember {
-        context.getSharedPreferences(ReelGuardAccessibilityService.PREFS_NAME, Context.MODE_PRIVATE)
+    var hasNotificationPermission by remember {
+        mutableStateOf(
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                ContextCompat.checkSelfPermission(
+                    context,
+                    Manifest.permission.POST_NOTIFICATIONS
+                ) == PackageManager.PERMISSION_GRANTED
+            } else {
+                true
+            }
+        )
     }
+
+    val notificationLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.RequestPermission()
+    ) { isGranted ->
+        hasNotificationPermission = isGranted
+    }
+
+    // Configurable time limit (minutes)
+    var alertMinutes by remember {
+        mutableIntStateOf(
+            prefs.getInt(
+                ReelGuardAccessibilityService.KEY_ALERT_MINUTES,
+                ReelGuardAccessibilityService.DEFAULT_ALERT_MINUTES
+            )
+        )
+    }
+
     var demoMode by remember {
         mutableStateOf(prefs.getBoolean(ReelGuardAccessibilityService.KEY_DEMO_MODE, false))
     }
@@ -111,6 +145,12 @@ fun ReelLimitHomeScreen(
             if (event == Lifecycle.Event.ON_RESUME) {
                 hasOverlayPermission = Settings.canDrawOverlays(context)
                 isAccessibilityEnabled = isAccessibilityServiceEnabled(context, ReelGuardAccessibilityService::class.java)
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                    hasNotificationPermission = ContextCompat.checkSelfPermission(
+                        context,
+                        Manifest.permission.POST_NOTIFICATIONS
+                    ) == PackageManager.PERMISSION_GRANTED
+                }
             }
         }
         lifecycleOwner.lifecycle.addObserver(observer)
@@ -148,10 +188,133 @@ fun ReelLimitHomeScreen(
                 )
                 Spacer(modifier = Modifier.height(4.dp))
                 Text(
-                    text = "Monitors Instagram, YouTube, and Facebook. Alerts you at 5 minutes and closes the app to home screen after 6 minutes.",
+                    text = "Monitors Instagram, YouTube, and Facebook. Displays live timers in the notification bar, alerts you when your limit is reached, and safely returns home.",
                     style = MaterialTheme.typography.bodyMedium,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
+            }
+
+            // Configurable Time Limit Card
+            item {
+                Card(
+                    modifier = Modifier.fillMaxWidth(),
+                    shape = RoundedCornerShape(16.dp),
+                    colors = CardDefaults.cardColors(
+                        containerColor = MaterialTheme.colorScheme.primaryContainer
+                    )
+                ) {
+                    Column(modifier = Modifier.padding(16.dp)) {
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Text(
+                                text = "⏱️ Time Limit Setting",
+                                style = MaterialTheme.typography.titleMedium,
+                                fontWeight = FontWeight.Bold,
+                                color = MaterialTheme.colorScheme.onPrimaryContainer
+                            )
+                            Surface(
+                                shape = RoundedCornerShape(8.dp),
+                                color = MaterialTheme.colorScheme.primary
+                            ) {
+                                Text(
+                                    text = "$alertMinutes mins",
+                                    color = MaterialTheme.colorScheme.onPrimary,
+                                    fontWeight = FontWeight.Bold,
+                                    fontSize = 15.sp,
+                                    modifier = Modifier.padding(horizontal = 10.dp, vertical = 4.dp)
+                                )
+                            }
+                        }
+
+                        Spacer(modifier = Modifier.height(8.dp))
+                        Text(
+                            text = "Alerts at $alertMinutes mins • Auto-closes to Home at ${alertMinutes + 1} mins",
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = MaterialTheme.colorScheme.onPrimaryContainer
+                        )
+
+                        Spacer(modifier = Modifier.height(12.dp))
+
+                        // Slider (1 to 30 minutes)
+                        Slider(
+                            value = alertMinutes.toFloat(),
+                            onValueChange = { newValue ->
+                                alertMinutes = newValue.toInt()
+                                prefs.edit().putInt(ReelGuardAccessibilityService.KEY_ALERT_MINUTES, alertMinutes).apply()
+                            },
+                            valueRange = 1f..30f,
+                            steps = 28
+                        )
+
+                        // Quick Preset Chips
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween
+                        ) {
+                            listOf(2, 5, 10, 15, 20).forEach { preset ->
+                                FilterChip(
+                                    selected = alertMinutes == preset,
+                                    onClick = {
+                                        alertMinutes = preset
+                                        prefs.edit().putInt(ReelGuardAccessibilityService.KEY_ALERT_MINUTES, preset).apply()
+                                    },
+                                    label = { Text("${preset}m") }
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Notification Live Timer Card
+            item {
+                Card(
+                    modifier = Modifier.fillMaxWidth(),
+                    shape = RoundedCornerShape(16.dp),
+                    colors = CardDefaults.cardColors(
+                        containerColor = MaterialTheme.colorScheme.surfaceVariant
+                    )
+                ) {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(16.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.SpaceBetween
+                    ) {
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text(
+                                text = "🔔 Live Notification Timer",
+                                style = MaterialTheme.typography.titleMedium,
+                                fontWeight = FontWeight.SemiBold
+                            )
+                            Spacer(modifier = Modifier.height(4.dp))
+                            Text(
+                                text = if (hasNotificationPermission) {
+                                    "Active: When in monitored apps, a real-time chronometer appears in the notification drawer."
+                                } else {
+                                    "Notification permission required to display the live timer in the status bar."
+                                },
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
+
+                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU && !hasNotificationPermission) {
+                            Spacer(modifier = Modifier.width(8.dp))
+                            Button(
+                                onClick = {
+                                    notificationLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+                                }
+                            ) {
+                                Text("Enable")
+                            }
+                        }
+                    }
+                }
             }
 
             // Required Permissions Card
@@ -174,7 +337,7 @@ fun ReelLimitHomeScreen(
                         // Permission 1: Overlay
                         PermissionItem(
                             title = "1. Display Over Other Apps",
-                            description = "Required to draw the 5-min warning alert over Instagram & YouTube.",
+                            description = "Required to draw the alert popup over Instagram & YouTube.",
                             isGranted = hasOverlayPermission,
                             buttonText = if (hasOverlayPermission) "Granted ✓" else "Grant Permission",
                             onClick = onOpenOverlaySettings
@@ -187,7 +350,7 @@ fun ReelLimitHomeScreen(
                         // Permission 2: Accessibility
                         PermissionItem(
                             title = "2. Accessibility Service",
-                            description = "Required to detect when social apps open/close and take you home at 6 mins.",
+                            description = "Required to track foreground social apps and auto-close when time is up.",
                             isGranted = isAccessibilityEnabled,
                             buttonText = if (isAccessibilityEnabled) "Active ✓" else "Enable Service",
                             onClick = onOpenAccessibilitySettings
@@ -220,7 +383,7 @@ fun ReelLimitHomeScreen(
                             )
                             Spacer(modifier = Modifier.height(4.dp))
                             Text(
-                                text = if (demoMode) "Active: 10s alert, 15s home close (for testing)" else "Standard: 5 min alert, 6 min home close",
+                                text = if (demoMode) "Active: 10s alert, 15s home close (overrides custom minutes for quick test)" else "Standard: $alertMinutes min alert, ${alertMinutes + 1} min auto-close",
                                 style = MaterialTheme.typography.bodySmall
                             )
                         }
@@ -244,7 +407,7 @@ fun ReelLimitHomeScreen(
                 )
                 Spacer(modifier = Modifier.height(8.dp))
                 Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                    ReelGuardAccessibilityService.DEFAULT_TARGET_APPS.forEach { (pkg, name) ->
+                    ReelGuardAccessibilityService.DEFAULT_TARGET_APPS.forEach { (_, name) ->
                         Surface(
                             modifier = Modifier.fillMaxWidth(),
                             shape = RoundedCornerShape(12.dp),
@@ -259,7 +422,7 @@ fun ReelLimitHomeScreen(
                             ) {
                                 Text(name, fontWeight = FontWeight.Medium)
                                 Text(
-                                    "5m warn / 6m exit",
+                                    "${alertMinutes}m warn / ${alertMinutes + 1}m exit",
                                     fontSize = 12.sp,
                                     color = MaterialTheme.colorScheme.primary
                                 )

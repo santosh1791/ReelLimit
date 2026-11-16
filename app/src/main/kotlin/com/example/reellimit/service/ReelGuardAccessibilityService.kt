@@ -9,17 +9,21 @@ import android.os.Looper
 import android.os.SystemClock
 import android.util.Log
 import android.view.accessibility.AccessibilityEvent
+import com.example.reellimit.notification.NotificationHelper
 import com.example.reellimit.overlay.OverlayAlertManager
 
 class ReelGuardAccessibilityService : AccessibilityService() {
 
     private lateinit var overlayManager: OverlayAlertManager
+    private lateinit var notificationHelper: NotificationHelper
     private val mainHandler = Handler(Looper.getMainLooper())
 
     companion object {
         const val TAG = "ReelGuardService"
         const val PREFS_NAME = "reel_limit_prefs"
         const val KEY_DEMO_MODE = "demo_mode"
+        const val KEY_ALERT_MINUTES = "alert_minutes"
+        const val DEFAULT_ALERT_MINUTES = 5
 
         // Default monitored social apps
         val DEFAULT_TARGET_APPS = mapOf(
@@ -38,16 +42,17 @@ class ReelGuardAccessibilityService : AccessibilityService() {
     private var alertShown: Boolean = false
     private var isTickerRunning: Boolean = false
 
-    // Anti-loop cooldown: ignores exit animation events right after auto-closing
+    // Anti-loop cooldowns:
+    // 1. For auto-closing (when limit reached)
     private var lastAutoExitTime: Long = 0L
     private val AUTO_EXIT_COOLDOWN_MS = 3500L
 
-    // Thresholds
-    // Production: 5 minutes (300,000 ms) alert, 6 minutes (360,000 ms) exit
-    private val PROD_ALERT_MS = 5 * 60 * 1000L
-    private val PROD_EXIT_MS = 6 * 60 * 1000L
+    // 2. For manual home exit (ignores trailing minimize/onStop events from the closing app)
+    private var lastUserHomeTime: Long = 0L
+    private var lastClosedAppPackage: String? = null
+    private val MANUAL_HOME_COOLDOWN_MS = 2500L
 
-    // Demo: 10 seconds alert, 15 seconds exit
+    // Demo Mode timings (10 seconds alert, 15 seconds exit)
     private val DEMO_ALERT_MS = 10 * 1000L
     private val DEMO_EXIT_MS = 15 * 1000L
 
@@ -60,9 +65,10 @@ class ReelGuardAccessibilityService : AccessibilityService() {
             val pkg = activeAppPackage ?: return
             val appName = DEFAULT_TARGET_APPS[pkg] ?: pkg
             val isDemo = isDemoMode()
+            val alertMinutes = getAlertMinutes()
 
-            val alertThreshold = if (isDemo) DEMO_ALERT_MS else PROD_ALERT_MS
-            val exitThreshold = if (isDemo) DEMO_EXIT_MS else PROD_EXIT_MS
+            val alertThreshold = if (isDemo) DEMO_ALERT_MS else (alertMinutes * 60 * 1000L)
+            val exitThreshold = if (isDemo) DEMO_EXIT_MS else ((alertMinutes + 1) * 60 * 1000L)
 
             val elapsed = SystemClock.elapsedRealtime() - sessionStartTime
             val elapsedSec = elapsed / 1000
@@ -79,7 +85,7 @@ class ReelGuardAccessibilityService : AccessibilityService() {
                 val msg = if (isDemo) {
                     "⚡ [DEMO] ${alertSec}s exceeded for $appName!"
                 } else {
-                    "Usage of 5 mins for $appName exceeded!"
+                    "Usage of $alertMinutes mins for $appName exceeded! App will auto-close in 1 minute."
                 }
                 Log.d(TAG, "[$appName] Threshold reached (${alertSec}s) -> Showing Overlay Alert!")
                 overlayManager.showAlert(appName, msg) {
@@ -91,6 +97,7 @@ class ReelGuardAccessibilityService : AccessibilityService() {
             if (elapsed >= exitThreshold) {
                 Log.d(TAG, "[$appName] Maximum limit reached (${exitSec}s)! Closing app and returning to home screen.")
                 lastAutoExitTime = SystemClock.elapsedRealtime()
+                lastClosedAppPackage = pkg
                 stopSession(dismissOverlay = true)
                 takeUserToHomeScreen()
                 return
@@ -104,6 +111,7 @@ class ReelGuardAccessibilityService : AccessibilityService() {
     override fun onServiceConnected() {
         super.onServiceConnected()
         overlayManager = OverlayAlertManager(this)
+        notificationHelper = NotificationHelper(this)
         Log.d(TAG, "ReelGuardAccessibilityService connected and ready")
     }
 
@@ -114,21 +122,26 @@ class ReelGuardAccessibilityService : AccessibilityService() {
 
         val pkgName = event.packageName?.toString() ?: return
 
-        // CRITICAL FIX 1:
-        // Do NOT process events from our own app or overlay!
+        // 1. Ignore events from our own app or overlay
         if (pkgName == packageName) {
             return
         }
 
-        // CRITICAL FIX 2:
-        // Ignore transient system packages
+        // 2. Ignore transient system packages (status bar, volume dialog, keyboard, autofill, notification shade)
+        // Pulling down the notification shade (com.android.systemui) does NOT interrupt the session!
         if (isSystemTransientPackage(pkgName)) {
             return
         }
 
-        // CRITICAL FIX 3:
-        // Cooldown check: ignore lingering window events from an app that was just auto-closed
+        // 3. Auto-close cooldown check
         if (SystemClock.elapsedRealtime() - lastAutoExitTime < AUTO_EXIT_COOLDOWN_MS) {
+            return
+        }
+
+        // 4. Manual Home exit cooldown check:
+        // Ignore trailing minimize/onStop window events from the app that the user just closed to Home
+        if (SystemClock.elapsedRealtime() - lastUserHomeTime < MANUAL_HOME_COOLDOWN_MS && pkgName == lastClosedAppPackage) {
+            Log.d(TAG, "Ignoring trailing minimize event from closed app ($pkgName)")
             return
         }
 
@@ -147,6 +160,8 @@ class ReelGuardAccessibilityService : AccessibilityService() {
             if (activeAppPackage != null) {
                 if (isLauncherPackage(pkgName)) {
                     Log.d(TAG, "User returned to Home/Launcher ($pkgName). Stopping session.")
+                    lastUserHomeTime = SystemClock.elapsedRealtime()
+                    lastClosedAppPackage = activeAppPackage
                     cancelPendingGraceExit()
                     stopSession(dismissOverlay = true)
                 } else {
@@ -165,7 +180,17 @@ class ReelGuardAccessibilityService : AccessibilityService() {
 
         val appName = DEFAULT_TARGET_APPS[packageName] ?: packageName
         val isDemo = isDemoMode()
-        Log.d(TAG, "=== STARTED MONITORING [$appName] (Demo=$isDemo) ===")
+        val alertMinutes = getAlertMinutes()
+
+        Log.d(TAG, "=== STARTED MONITORING [$appName] (Limit=${alertMinutes}m, Demo=$isDemo) ===")
+
+        // Show live chronometer timer in notification shade
+        notificationHelper.showTimerNotification(
+            appName = appName,
+            sessionStartTimeWallClock = System.currentTimeMillis(),
+            alertMinutes = alertMinutes,
+            isDemo = isDemo
+        )
 
         mainHandler.post(tickerRunnable)
     }
@@ -177,6 +202,10 @@ class ReelGuardAccessibilityService : AccessibilityService() {
         }
         if (dismissOverlay) {
             overlayManager.dismiss()
+        }
+        // Dismiss notification timer when exiting monitored app
+        if (::notificationHelper.isInitialized) {
+            notificationHelper.dismissTimerNotification()
         }
         activeAppPackage = null
         alertShown = false
@@ -202,11 +231,9 @@ class ReelGuardAccessibilityService : AccessibilityService() {
     }
 
     private fun takeUserToHomeScreen() {
-        // Method 1: Global Action Home
         val performed = performGlobalAction(GLOBAL_ACTION_HOME)
         Log.d(TAG, "performGlobalAction(GLOBAL_ACTION_HOME) returned: $performed")
 
-        // Method 2: Fallback Intent (guarantees home navigation on all OEMs including Xiaomi HyperOS)
         try {
             val homeIntent = Intent(Intent.ACTION_MAIN).apply {
                 addCategory(Intent.CATEGORY_HOME)
@@ -252,6 +279,11 @@ class ReelGuardAccessibilityService : AccessibilityService() {
     private fun isDemoMode(): Boolean {
         val prefs = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
         return prefs.getBoolean(KEY_DEMO_MODE, false)
+    }
+
+    private fun getAlertMinutes(): Int {
+        val prefs = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        return prefs.getInt(KEY_ALERT_MINUTES, DEFAULT_ALERT_MINUTES)
     }
 
     override fun onInterrupt() {
